@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     max_iterations: int = Field(default=5, description="Max ReAct iterations")
     max_tool_rounds: int = Field(default=25, description="Max tool call rounds per chat turn")
     
+    # Memory / Vector DB
+    memory_dir: str = Field(default="./memory_db", description="ChromaDB persistence directory")
+    embedding_model: str = Field(default="nomic-embed-text", description="Ollama embedding model")
+    memory_top_k: int = Field(default=5, description="Number of memories to retrieve per query")
+    
     # File Storage
     upload_dir: str = Field(default="./uploads", description="Directory for uploaded files")
     

@@ -28,6 +28,7 @@ def get_or_create_agent(session_id: str) -> Agent:
     """Get existing agent or create new one. Auto-reloads file if session was lost due to restart."""
     if session_id not in agents:
         agent = Agent()
+        agent.session_id = session_id
         agents[session_id] = agent
         
         # Try to find and reload the file for this session (handles server restarts)

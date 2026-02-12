@@ -5,6 +5,7 @@ Uses SKILL.md patterns for Excel analysis best practices.
 
 import json
 import math
+import os
 from typing import Any
 from pathlib import Path
 from openai import OpenAI
@@ -14,32 +15,42 @@ import numpy as np
 from config.settings import settings
 from agent.tools import Tool, registry
 from agent.xlsx_tool import XLSXTool
+from agent.memory import MemoryStore
 
 
-class SafeEncoder(json.JSONEncoder):
-    """Handles pandas/numpy types that aren't JSON serializable."""
-    def default(self, obj):
-        if obj is pd.NaT:
+def _clean_for_json(obj):
+    """Recursively convert pandas/numpy types to JSON-safe Python types."""
+    if obj is None:
+        return None
+    if obj is pd.NaT:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_for_json(v) for v in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
             return None
-        if isinstance(obj, pd.Timestamp):
-            return obj.isoformat() if not pd.isna(obj) else None
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return None if np.isnan(obj) else float(obj)
-        if isinstance(obj, np.bool_):
-            return bool(obj)
-        if isinstance(obj, (np.ndarray,)):
-            return obj.tolist()
-        if isinstance(obj, float) and math.isnan(obj):
-            return None
-        if hasattr(obj, 'isoformat'):
-            return obj.isoformat()
-        return super().default(obj)
+        return obj
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat() if not pd.isna(obj) else None
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        return None if math.isnan(v) or math.isinf(v) else v
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (np.ndarray,)):
+        return _clean_for_json(obj.tolist())
+    if hasattr(obj, 'isoformat'):
+        return obj.isoformat()
+    return obj
 
 
 def safe_dumps(obj):
-    return json.dumps(obj, cls=SafeEncoder, default=str)
+    """JSON-serialize with all pandas/numpy types converted to safe values."""
+    return json.dumps(_clean_for_json(obj), default=str)
 
 
 class Agent:
@@ -76,6 +87,8 @@ When a user asks about data:
         )
         self.model = settings.model_name
         self.xlsx_tool = XLSXTool()
+        self.memory = MemoryStore()
+        self.session_id: str | None = None
         self._register_tools()
         self.conversation: list[dict] = []
         self.current_file_path: str | None = None
@@ -128,6 +141,39 @@ When a user asks about data:
                 "required": ["code"]
             }
         ))
+        
+        # Memory tools — let the LLM save/recall insights
+        registry.register(Tool(
+            name="save_memory",
+            description="Save an important insight or fact to persistent memory for future reference. Use this when you discover key patterns, definitions, or findings about the data.",
+            function=self._handle_save_memory,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The insight or fact to remember"
+                    }
+                },
+                "required": ["text"]
+            }
+        ))
+        
+        registry.register(Tool(
+            name="recall_memory",
+            description="Search past memories for relevant context. Use this when you need background info or past analysis results.",
+            function=self._handle_recall_memory,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for finding relevant memories"
+                    }
+                },
+                "required": ["query"]
+            }
+        ))
     
     def _handle_xlsx(self, action: str, sheet_name: str = None, query: str = None) -> dict:
         """Handle XLSX tool calls."""
@@ -150,8 +196,21 @@ When a user asks about data:
         
         return self.xlsx_tool.run_pandas_code(code, sheet_name)
     
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt, including file context if a file is loaded."""
+    def _handle_save_memory(self, text: str) -> dict:
+        """Save a memory via LLM tool call."""
+        file_name = os.path.basename(self.current_file_path) if self.current_file_path else None
+        mem_id = self.memory.add(text, metadata={"type": "insight", "file_name": file_name or ""}, session_id=self.session_id)
+        return {"status": "saved", "memory_id": mem_id}
+    
+    def _handle_recall_memory(self, query: str) -> dict:
+        """Recall memories via LLM tool call."""
+        memories = self.memory.search(query, session_id=None)  # Search across all sessions
+        if not memories:
+            return {"result": "No relevant memories found."}
+        return {"result": [{"text": m["text"], "relevance": m["score"]} for m in memories]}
+    
+    def _build_system_prompt(self, user_query: str = "") -> str:
+        """Build the system prompt, including file context and relevant memories."""
         prompt = self.SYSTEM_PROMPT
         
         if self.xlsx_tool.dataframes:
@@ -167,6 +226,12 @@ Use the `run_pandas` tool for precise calculations on this data.
 {context}
 === END OF FILE DATA ==="""
         
+        # Inject relevant memories
+        if user_query:
+            memory_context = self.memory.get_context_for_query(user_query)
+            if memory_context:
+                prompt += f"\n\n{memory_context}"
+        
         return prompt
     
     def load_file(self, file_path: str) -> dict:
@@ -181,7 +246,7 @@ Use the `run_pandas` tool for precise calculations on this data.
         """Chat with the agent (REST fallback). Supports multi-round tool calling."""
         self.conversation.append({"role": "user", "content": user_message})
         
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(user_query=user_message)
         messages = [{"role": "system", "content": system_prompt}] + self.conversation
         tools = registry.list_tools()
         
@@ -201,6 +266,12 @@ Use the `run_pandas` tool for precise calculations on this data.
                     # Final text response
                     content = assistant_message.content or ""
                     self.conversation.append({"role": "assistant", "content": content})
+                    # Save to memory
+                    self.memory.save_conversation_turn(
+                        user_message, content,
+                        session_id=self.session_id,
+                        file_name=os.path.basename(self.current_file_path) if self.current_file_path else None
+                    )
                     return content
                 
                 # Process tool calls, then loop for next round
@@ -243,7 +314,7 @@ Use the `run_pandas` tool for precise calculations on this data.
         """
         self.conversation.append({"role": "user", "content": user_message})
         
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(user_query=user_message)
         messages = [{"role": "system", "content": system_prompt}] + self.conversation
         tools = registry.list_tools()
         
@@ -265,6 +336,12 @@ Use the `run_pandas` tool for precise calculations on this data.
                     # Final text response
                     content = assistant_message.content or ""
                     self.conversation.append({"role": "assistant", "content": content})
+                    # Save to memory
+                    self.memory.save_conversation_turn(
+                        user_message, content,
+                        session_id=self.session_id,
+                        file_name=os.path.basename(self.current_file_path) if self.current_file_path else None
+                    )
                     yield {"type": "response", "content": content}
                     return
                 
